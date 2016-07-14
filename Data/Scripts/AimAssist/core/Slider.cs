@@ -65,7 +65,7 @@ namespace LSE.Control
             }
             return Standard;
         }
-
+        
         public virtual void Setter(IMyTerminalBlock block, float value)
         {
             MyAPIGateway.Utilities.SetVariable<float>(block.EntityId.ToString() + InternalName, value);

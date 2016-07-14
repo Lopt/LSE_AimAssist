@@ -90,6 +90,18 @@ namespace LSE.AimHelper
             return item.Data as MyObjectBuilder_ToolbarItemWeapon;
         }
 
+        static public AmmoType GetFirstAmmo(IMyCubeBlock seat)
+        {
+            var ammos = GetCurrentAmmos(seat);
+            if (ammos.Count() > 0)
+            {
+                return ammos.First();
+            }
+            return null;
+        }
+
+        //static public IMyEntity GetWeapon
+
 
         static private MyObjectBuilder_ToolbarItemWeapon m_savedWeaponType;
         static private HashSet<AmmoType> m_ammoTypes = new HashSet<AmmoType>();

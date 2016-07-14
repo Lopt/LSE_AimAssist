@@ -47,14 +47,50 @@ namespace LSE.AimHelper
         
         public bool FirstStart = true;
 
-
         public bool DEBUG = false;
         public LineD? DrawLine;
+
+        public Control.SwitchControl<T> ShootLockTarget;
 
         public class AimIndicator
         {
             public Vector3D PredictedPosition;
             public string Name;
+        }
+
+        long LastShootTime;
+        public bool DidShoot()
+        {
+            var currentWeaponDef = Helper.GetCurrentWeapon((IMyCubeBlock)Entity);
+            if (currentWeaponDef == null)
+            {
+                return false;
+            }
+            var weapons = new List<IMySlimBlock>();
+            (Entity as IMyCubeBlock).CubeGrid.GetBlocks(weapons, (x) => (x.BlockDefinition.Id == currentWeaponDef.defId));
+            if (weapons.Count() > 0)
+            {
+                var ob = weapons[0].GetObjectBuilder();
+                long newShootTime = 0;
+                if (ob is MyObjectBuilder_SmallGatlingGun)
+                {
+                    newShootTime = (ob as MyObjectBuilder_SmallGatlingGun).GunBase.LastShootTime;
+                }
+                else if  (ob is MyObjectBuilder_SmallMissileLauncher)
+                {
+                    newShootTime = (ob as MyObjectBuilder_SmallMissileLauncher).GunBase.LastShootTime;
+                }
+                else if  (ob is MyObjectBuilder_SmallMissileLauncherReload)
+                {
+                    newShootTime = (ob as MyObjectBuilder_SmallMissileLauncherReload).GunBase.LastShootTime;
+                }
+                if (newShootTime > LastShootTime)
+                {
+                    LastShootTime = newShootTime;
+                    return true;
+                }
+            }
+            return false;
         }
 
         public override void UpdateBeforeSimulation()
@@ -95,7 +131,16 @@ namespace LSE.AimHelper
             }
             try
             {
-                
+                if (ShootLockTarget.Getter((IMyTerminalBlock)Entity) && DidShoot())
+                {
+                    var newTarget = FindTargetByPrediction();
+                    if (newTarget != null)
+                    {
+                        Target = newTarget;
+                    }
+                }
+
+
                 if (MyAPIGateway.Session.LocalHumanPlayer.Controller.ControlledEntity.Entity == Entity)
                 {
                     HadLocalPlayerAccess = true;
@@ -113,7 +158,7 @@ namespace LSE.AimHelper
             }
             catch (Exception error)
             {
-                //MyAPIGateway.Utilities.ShowNotification(error.Message);
+                // MyAPIGateway.Utilities.ShowNotification(error.Message);
             }
         }
 
@@ -124,6 +169,29 @@ namespace LSE.AimHelper
                 MyAPIGateway.Session.GPS.RemoveLocalGps(CurrentGPS);
                 CurrentGPS = null;
             };
+        }
+
+        public IMyEntity FindTargetByPrediction()
+        {
+            var currentWeaponDef = Helper.GetCurrentWeapon((IMyCubeBlock)Entity);
+            if (currentWeaponDef == null)
+            {
+                RemoveGPS();
+                return null;
+            }
+            var usedAmmo = Helper.GetFirstAmmo((IMyCubeBlock)Entity);
+            if (usedAmmo == null)
+            {
+                return null;
+            }
+
+            var entities = new HashSet<IMyEntity>();
+            var line = GetTargetLine();            
+
+            MyAPIGateway.Entities.GetEntities(entities, (x) => (x is IMyCubeGrid &&
+                x.WorldAABB.Translate(CalculateAimPosition(x, currentWeaponDef.defId, usedAmmo).PredictedPosition - x.Physics.CenterOfMassWorld).Intersects(ref line)));
+            entities.Remove((Entity as IMyCubeBlock).CubeGrid);
+            return GetClosestShip(entities);    
         }
 
         void SetGPS()
@@ -144,7 +212,19 @@ namespace LSE.AimHelper
                 }
                 else
                 {
-                    var indicator = CalculateAimPosition(Target);
+                    var currentWeaponDef = Helper.GetCurrentWeapon((IMyCubeBlock)Entity);
+                    if (currentWeaponDef == null)
+                    {
+                        RemoveGPS();
+                        return;
+                    }
+                    var usedAmmo = Helper.GetFirstAmmo((IMyCubeBlock)Entity);
+                    if (usedAmmo == null)
+                    {
+                        return;
+                    }
+
+                    var indicator = CalculateAimPosition(Target, currentWeaponDef.defId, usedAmmo);
                     if (indicator != null)
                     {
                         if (CurrentGPS == null)
@@ -153,6 +233,7 @@ namespace LSE.AimHelper
                         }
                         else
                         {
+                            CurrentGPS.Name = indicator.Name;
                             CurrentGPS.Coords = indicator.PredictedPosition;
                             CurrentGPS.UpdateHash();
                         }
@@ -172,19 +253,18 @@ namespace LSE.AimHelper
             double oldTime,
             int depth)
         {
-            enemyVelocity = (enemyVelocity - ownVelocity);
-            ownVelocity = Vector3D.Zero;
-            var enemyCalcPos = enemyPos + enemyVelocity * oldTime;
-            var ownCalcPos = ownPos + ownVelocity * oldTime;
+            var relEnemyVelocity = (enemyVelocity - ownVelocity) / 2;
+            var enemyCalcPos = enemyPos + relEnemyVelocity * oldTime;
+            //var ownCalcPos = ownPos;// +ownVelocity * oldTime;
             var bulletVelocity = (enemyCalcPos - ownPos);
             bulletVelocity.Normalize();
             if (oldTime == 0)
             {
-                oldTime = 0.1;
+                oldTime = 0.01;
             }
-            bulletVelocity = bulletVelocity * ammoDef.GetPathAt(oldTime) / oldTime + ownVelocity;
+            bulletVelocity = bulletVelocity * ammoDef.GetPathAt(oldTime) / oldTime; //+ ownVelocity;
 
-            var pathLength = (enemyCalcPos - ownCalcPos).Length();
+            var pathLength = (enemyCalcPos - ownPos).Length();
 
             var newTime = pathLength / bulletVelocity.Length();
             if (depth == 0 || (newTime - oldTime) < 0.000001)
@@ -229,57 +309,44 @@ namespace LSE.AimHelper
             return m_lastReturn;
         }
 
-
         MyDefinitionId m_lastWeaponId;
-        public AimIndicator CalculateAimPosition(IMyEntity target)
+        public AimIndicator CalculateAimPosition(IMyEntity target, MyDefinitionId weaponId, AmmoType usedAmmo)
         {
             var ownGrid = (Entity as IMyCubeBlock).CubeGrid;
-            var currentWeaponDef = Helper.GetCurrentWeapon((IMyCubeBlock)Entity);
-            if (currentWeaponDef == null)
+            var weaponCenter = CalculateWeaponCenter(weaponId); // Vector3I.Zero;// 
+            if (weaponCenter == null)
             {
-                RemoveGPS();
                 return null;
             }
-            var ammoTypes = Helper.GetCurrentAmmos((IMyCubeBlock)Entity);
-            if (ammoTypes.Count() > 0)
+
+            var cameraPos = MyAPIGateway.Session.Camera.Position;
+            if (Entity is Sandbox.ModAPI.Ingame.IMyCockpit && MyAPIGateway.Session.CameraController.IsInFirstPersonView)
             {
-                var usedAmmo = ammoTypes.First();
-                var weaponCenter = CalculateWeaponCenter(currentWeaponDef.defId); // Vector3I.Zero;// 
-                if (weaponCenter == null)
-                {
-                    return null;
-                }
-
-                var cameraPos = MyAPIGateway.Session.Camera.Position;
-                if (Entity is Sandbox.ModAPI.Ingame.IMyCockpit && MyAPIGateway.Session.CameraController.IsInFirstPersonView)
-                {
-                    cameraPos = Entity.GetPosition();
-                }
-
-                var ownPos = (Entity as IMyCubeBlock).CubeGrid.GridIntegerToWorld(weaponCenter.Value); // Entity.GetPosition()
-                
-                var targetPos = ApproximatePosition(
-                    ownPos,
-                    ownGrid.Physics.LinearVelocity,
-                    usedAmmo,
-                    target.Physics.CenterOfMassWorld,
-                    target.Physics.LinearVelocity,
-                    0.0f,
-                    20);
-
-                var indicatorName = "OUT OF RANGE";
-                if ((targetPos - ownPos).LengthSquared() < Math.Pow(usedAmmo.Trajectory, 2))
-                {
-                    indicatorName = "TARGET";
-                }
-
-                return new AimIndicator()
-                {
-                    PredictedPosition = targetPos + (cameraPos - ownPos),
-                    Name = indicatorName
-                };
+                cameraPos = Entity.GetPosition();
             }
-            return null;
+
+            var ownPos = (Entity as IMyCubeBlock).CubeGrid.GridIntegerToWorld(weaponCenter.Value); // Entity.GetPosition()
+                
+            var targetPos = ApproximatePosition(
+                ownPos,
+                ownGrid.Physics.LinearVelocity,
+                usedAmmo,
+                target.Physics.CenterOfMassWorld,
+                target.Physics.LinearVelocity,
+                0.0f,
+                20);
+
+            var indicatorName = "OUT OF RANGE";
+            if ((targetPos - ownPos).LengthSquared() < Math.Pow(usedAmmo.Trajectory, 2))
+            {
+                indicatorName = "TARGET";
+            }
+
+            return new AimIndicator()
+            {
+                PredictedPosition = targetPos + (cameraPos - ownPos),
+                Name = indicatorName
+            };
         }
 
         public bool ReturnFalse(IMyTerminalBlock block)
@@ -290,7 +357,51 @@ namespace LSE.AimHelper
         public void CreateUI()
         {
             new LockAction<T>((IMyTerminalBlock)Entity, "LockTarget", "Lock Target");
+            ShootLockTarget = new Control.SwitchControl<T>((IMyTerminalBlock)Entity, "LockOnShoot", "Auto Lock Target", "On", "Off", true);
         }
+
+        public IMyEntity GetClosestShip(HashSet<IMyEntity> entities)
+        {
+            double lowestDistance = double.PositiveInfinity;
+            IMyEntity nextTarget = null;
+            foreach (var entity in entities)
+            {
+                var distance = Distance(entity);
+                if (distance < lowestDistance)
+                {
+                    lowestDistance = distance;
+                    nextTarget = entity;
+                }
+            }
+            return nextTarget;
+        }
+
+        public double Distance(IMyEntity foreignEntity)
+        {
+            // the entity may not be in direct sight of the block - because the AABB is too big.
+            // here the AABB size will be added, so it's a tendencially higher chance to lock smaller targets if both intersect
+            var additionalLengthSqaured = foreignEntity.LocalAABB.Size.LengthSquared();
+
+            //var forward = block.WorldMatrix.Forward;
+
+            return (Entity.GetPosition() - foreignEntity.Physics.CenterOfMassWorld).LengthSquared() + additionalLengthSqaured;
+        }
+
+        public LineD GetTargetLine()
+        {
+            var cockpitMatrix = MyAPIGateway.Session.Camera.WorldMatrix;
+            if (Entity is Sandbox.ModAPI.Ingame.IMyCockpit)
+            {
+                cockpitMatrix = Entity.WorldMatrix;
+            }
+
+            var endPos = cockpitMatrix.Translation + cockpitMatrix.Forward * MAX_DISTANCE;
+
+            return new LineD(cockpitMatrix.Translation, endPos);
+        }
+
+
+
 
     }
 
@@ -301,21 +412,9 @@ namespace LSE.AimHelper
             IMyTerminalBlock block,
             string internalName,
             string name)
-            : base(block, internalName, name)
+            : base(block, internalName, name, "")
         {
         }
-
-        public double Distance(IMyTerminalBlock block, IMyEntity entity)
-        {
-            // the entity may not be in direct sight of the block - because the AABB is too big.
-            // here the AABB size will be added, so it's a tendencially higher chance to lock smaller targets if both intersect
-            var additionalLengthSqaured = entity.LocalAABB.Size.LengthSquared();
-            
-            //var forward = block.WorldMatrix.Forward;
-
-            return (block.GetPosition() - entity.GetPosition()).LengthSquared() + additionalLengthSqaured;
-        }
-
 
         public override void OnAction(IMyTerminalBlock block)
         {
@@ -327,43 +426,15 @@ namespace LSE.AimHelper
                 {
                     var player = MyAPIGateway.Session.LocalHumanPlayer;
                     //MyAPIGateway.Session.CameraController.
-                    var cockpitMatrix = MyAPIGateway.Session.Camera.WorldMatrix;
-                    if (block is Sandbox.ModAPI.Ingame.IMyCockpit)
-                    {
-                        cockpitMatrix = block.WorldMatrix;
-                    }
-
-                    var endPos = cockpitMatrix.Translation + cockpitMatrix.Forward * AimHelper<T>.MAX_DISTANCE;
-
-                    var line = new LineD(cockpitMatrix.Translation, endPos);
+                    var line = aimHelper.GetTargetLine();
                     //var color = new Vector4(128, 127, 127, 127);
                     //MySimpleObjectDraw.DrawLine(line.From, line.To, "Metal", ref color, 0.1f);
                     var entities = new HashSet<IMyEntity>();
                     aimHelper.DrawLine = line;
                     MyAPIGateway.Entities.GetEntities(entities, (x) => x.WorldAABB.Intersects(ref line) && x is IMyCubeGrid);
                     
-                    IMyEntity nextTarget = null;
-                    double lowestDistance = double.PositiveInfinity;
                     entities.Remove(block.CubeGrid);
-                    foreach (var entity in entities)
-                    {
-                        var distance = Distance(block, entity);
-                        if (distance < lowestDistance)
-                        {
-                            lowestDistance = distance;
-                            nextTarget = entity;
-                        }
-
-                        /*
-                        foreach (var owner in (entity as IMyCubeGrid).BigOwners)
-                        {
-                            if (MyAPIGateway.Session.LocalHumanPlayer.GetRelationTo(owner) == MyRelationsBetweenPlayerAndBlock.Enemies)
-                            {
-                            }
-                        }
-                                             break;
-    */
-                    }
+                    var nextTarget = aimHelper.GetClosestShip(entities);
                     aimHelper.Target = nextTarget;
                 }
             }
@@ -372,6 +443,7 @@ namespace LSE.AimHelper
                 //MyAPIGateway.Utilities.ShowNotification(error.Message);
             }
         }
+
     }
 
 
